@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field
 import httpx
 from openai import OpenAI
 from dotenv import load_dotenv
+import urllib.request
 
 # PostgreSQL ORM 라이브러리
 from sqlalchemy import create_engine, text
@@ -273,20 +274,33 @@ def render_to_markdown(note: StructuredMeetingNote) -> str:
 # 4. 한글 PDF 생성 엔진
 # =========================================================
 def get_korean_font_name() -> str:
-    candidates = [
-        ("MalgunGothic", "C:/Windows/Fonts/malgun.ttf"),
-        ("AppleGothic", "/System/Library/Fonts/Supplemental/AppleGothic.ttf"),
-        ("NanumGothic", "/usr/share/fonts/truetype/nanum/NanumGothic.ttf"),
-        ("NanumGothic", "/usr/share/fonts/nanum/NanumGothic.ttf")
-    ]
-    for font_name, path in candidates:
-        if os.path.exists(path):
-            try:
-                pdfmetrics.registerFont(TTFont(font_name, path))
+    """배포 환경(Linux) 및 로컬 환경 모두에서 한글 깨짐을 방지하는 자체 완결형 폰트 로더"""
+    font_name = "NanumGothic"
+    local_font_path = "NanumGothic.ttf"
+
+    # 1. 이미 폰트가 등록되어 있으면 그대로 반환
+    if font_name in pdfmetrics.getRegisteredFontNames():
+        return font_name
+
+    # 2. 로컬 디렉터리에 폰트 파일이 없으면 공식 CDN(GitHub/Google Fonts)에서 자동 1회 다운로드
+    if not os.path.exists(local_font_path):
+        font_url = "https://raw.githubusercontent.com/google/fonts/main/ofl/nanumgothic/NanumGothic-Regular.ttf"
+        try:
+            urllib.request.urlretrieve(font_url, local_font_path)
+        except Exception:
+            # 윈도우 로컬 폴백
+            win_font = "C:/Windows/Fonts/malgun.ttf"
+            if os.path.exists(win_font):
+                pdfmetrics.registerFont(TTFont(font_name, win_font))
                 return font_name
-            except Exception:
-                continue
-    return "Helvetica"
+            return "Helvetica"
+
+    # 3. 다운로드 또는 준비된 폰트 파일 등록
+    try:
+        pdfmetrics.registerFont(TTFont(font_name, local_font_path))
+        return font_name
+    except Exception:
+        return "Helvetica"
 
 
 def generate_pdf_bytes(note: StructuredMeetingNote) -> bytes:
