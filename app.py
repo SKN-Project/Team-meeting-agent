@@ -1,5 +1,7 @@
 import os
+import re
 import json
+import urllib.request
 from datetime import date
 from typing import List, Optional
 import streamlit as st
@@ -7,7 +9,6 @@ from pydantic import BaseModel, Field
 import httpx
 from openai import OpenAI
 from dotenv import load_dotenv
-import urllib.request
 
 # PostgreSQL ORM 라이브러리
 from sqlalchemy import create_engine, text
@@ -78,13 +79,11 @@ def get_db_engine():
     db_url = os.getenv("DATABASE_URL")
     if not db_url:
         return None
-
-    # 드라이버 미지정 시 psycopg 드라이버 명시
+    # SQLAlchemy 드라이버 URI 보정
     if db_url.startswith("postgres://"):
         db_url = db_url.replace("postgres://", "postgresql+psycopg://", 1)
     elif db_url.startswith("postgresql://") and "+psycopg" not in db_url and "+psycopg2" not in db_url:
         db_url = db_url.replace("postgresql://", "postgresql+psycopg://", 1)
-
     return create_engine(db_url, pool_pre_ping=True)
 
 
@@ -178,7 +177,56 @@ def format_past_meeting_as_context(structured_json_str: str) -> str:
 
 
 # =========================================================
-# 3. 마크다운 변환 렌더러
+# 3. 텍스트 일괄 파싱 유틸리티 함수
+# =========================================================
+def parse_raw_text_to_turns(raw_text: str) -> List[dict]:
+    """
+    '이름: 대화' 또는 '이름 : 대화' 형태의 멀티라인 텍스트를 파싱.
+    대화 내용 중간의 줄바꿈도 이전 발언에 자동으로 이어붙임.
+    """
+    turns = []
+    lines = raw_text.strip().split("\n")
+    # 이름과 발언을 구분하는 정규식: 시작 부분의 '이름: 내용' 패턴 매칭
+    pattern = re.compile(r"^([^:\n\r]+?)\s*:\s*(.*)$")
+
+    current_speaker = None
+    current_content = []
+
+    for line in lines:
+        line_str = line.strip()
+        if not line_str:
+            continue
+
+        match = pattern.match(line_str)
+        if match:
+            # 이전 발언 저장
+            if current_speaker and current_content:
+                turns.append({
+                    "speaker": current_speaker,
+                    "content": " ".join(current_content)
+                })
+            current_speaker = match.group(1).strip()
+            current_content = [match.group(2).strip()]
+        else:
+            # 콜론(:)이 없는 줄은 이전 화자의 발언이 이어진 것으로 처리
+            if current_speaker:
+                current_content.append(line_str)
+            else:
+                # 첫 줄부터 이름이 없는 경우 기본 화자 지정
+                current_speaker = "참석자"
+                current_content = [line_str]
+
+    if current_speaker and current_content:
+        turns.append({
+            "speaker": current_speaker,
+            "content": " ".join(current_content)
+        })
+
+    return turns
+
+
+# =========================================================
+# 4. 마크다운 변환 렌더러
 # =========================================================
 def render_to_markdown(note: StructuredMeetingNote) -> str:
     lines = []
@@ -271,31 +319,27 @@ def render_to_markdown(note: StructuredMeetingNote) -> str:
 
 
 # =========================================================
-# 4. 한글 PDF 생성 엔진
+# 5. 한글 PDF 생성 엔진 (CDN 한글 폰트 자동 탑재)
 # =========================================================
 def get_korean_font_name() -> str:
-    """배포 환경(Linux) 및 로컬 환경 모두에서 한글 깨짐을 방지하는 자체 완결형 폰트 로더"""
+    """Linux 배포 환경 및 로컬 환경에서 네모(■) 깨짐을 방지하는 폰트 로더"""
     font_name = "NanumGothic"
     local_font_path = "NanumGothic.ttf"
 
-    # 1. 이미 폰트가 등록되어 있으면 그대로 반환
     if font_name in pdfmetrics.getRegisteredFontNames():
         return font_name
 
-    # 2. 로컬 디렉터리에 폰트 파일이 없으면 공식 CDN(GitHub/Google Fonts)에서 자동 1회 다운로드
     if not os.path.exists(local_font_path):
         font_url = "https://raw.githubusercontent.com/google/fonts/main/ofl/nanumgothic/NanumGothic-Regular.ttf"
         try:
             urllib.request.urlretrieve(font_url, local_font_path)
         except Exception:
-            # 윈도우 로컬 폴백
             win_font = "C:/Windows/Fonts/malgun.ttf"
             if os.path.exists(win_font):
                 pdfmetrics.registerFont(TTFont(font_name, win_font))
                 return font_name
             return "Helvetica"
 
-    # 3. 다운로드 또는 준비된 폰트 파일 등록
     try:
         pdfmetrics.registerFont(TTFont(font_name, local_font_path))
         return font_name
@@ -388,7 +432,7 @@ def generate_pdf_bytes(note: StructuredMeetingNote) -> bytes:
 
 
 # =========================================================
-# 5. Streamlit 메인 애플리케이션
+# 6. Streamlit 메인 애플리케이션
 # =========================================================
 def main():
     st.set_page_config(page_title="팀 공유 회의록 관리 시스템", layout="wide", page_icon="📝")
@@ -410,12 +454,12 @@ def main():
     with st.sidebar:
         st.header("⚙️ 환경 설정")
         if api_key and api_key.strip():
-            st.success("✅ `.env` OpenAI Key 로드됨")
+            st.success("✅ OpenAI Key 로드됨")
         else:
             st.error("❌ `OPENAI_API_KEY` 없음")
 
         if db_url and db_url.strip():
-            st.success("✅ `.env` Supabase DB 로드됨")
+            st.success("✅ Supabase DB 로드됨")
         else:
             st.error("❌ `DATABASE_URL` 없음")
 
@@ -426,7 +470,7 @@ def main():
         for member in FIXED_MEMBER_POOL:
             st.markdown(f"- **{member}**")
 
-    # 탭 구성: [새 회의 작성] / [클라우드 보관함]
+    # 상단 탭 구성
     tab_new, tab_history = st.tabs(["📝 새 회의 작성 및 정리", "☁️ Supabase 클라우드 보관함"])
 
     # -----------------------------------------------------
@@ -452,36 +496,73 @@ def main():
             prev_context_text = st.text_area(
                 "이전 회의 맥락 / 팔로업 (보관함 탭에서 1클릭 복사 가능)",
                 value=st.session_state.prev_context_buffer,
-                height=90,
+                height=80,
                 placeholder="지난 회의 결정 사항이나 액션 아이템이 들어갑니다."
             )
             st.session_state.prev_context_buffer = prev_context_text
 
             st.markdown("---")
-            st.subheader("💬 실시간 턴 입력")
+            st.subheader("💬 대화 내용 입력")
 
-            if not selected_participants:
-                st.warning("금일 참석자를 1명 이상 선택해주세요.")
-            else:
-                with st.form("turn_input_form", clear_on_submit=True):
-                    c_spk, c_cnt = st.columns([3, 7])
-                    with c_spk:
-                        selected_speaker = st.selectbox("화자 선택", options=selected_participants)
-                    with c_cnt:
-                        turn_text = st.text_input("발언 내용", placeholder="예: 2안은 유지보수 비용이 이중으로 발생합니다.")
+            # [신규 기능] 탭으로 실시간 1건 입력 vs 외부 텍스트 일괄 붙여넣기 분기
+            input_mode_tab1, input_mode_tab2 = st.tabs(["⚡ 한 줄씩 실시간 입력", "📋 외부 대화 일괄 붙여넣기 (이름:대화)"])
 
-                    if st.form_submit_button("턴 추가 (+)", use_container_width=True) and turn_text.strip():
-                        st.session_state.turns.append({
-                            "speaker": selected_speaker,
-                            "content": turn_text.strip()
-                        })
-                        st.rerun()
+            with input_mode_tab1:
+                if not selected_participants:
+                    st.warning("금일 참석자를 1명 이상 선택해주세요.")
+                else:
+                    with st.form("turn_input_form", clear_on_submit=True):
+                        c_spk, c_cnt = st.columns([3, 7])
+                        with c_spk:
+                            selected_speaker = st.selectbox("화자 선택", options=selected_participants)
+                        with c_cnt:
+                            turn_text = st.text_input("발언 내용", placeholder="예: 2안은 유지보수 비용이 이중으로 발생합니다.")
+
+                        if st.form_submit_button("턴 추가 (+)", use_container_width=True) and turn_text.strip():
+                            st.session_state.turns.append({
+                                "speaker": selected_speaker,
+                                "content": turn_text.strip()
+                            })
+                            st.rerun()
+
+            with input_mode_tab2:
+                st.caption("카카오톡, 슬랙, 회의 메모 등에서 '이름: 내용' 형식으로 복사한 텍스트를 붙여넣으세요.")
+                bulk_text = st.text_area(
+                    "외부 텍스트 붙여넣기",
+                    height=130,
+                    placeholder="오호민: 이번 주 배포 일정 확인 부탁드립니다.\n신가을: QA 테스트 완료되어 내일 배포 가능합니다.\n김영석: 서버 인프라 모니터링 준비해두겠습니다."
+                )
+
+                col_b1, col_b2 = st.columns([1, 1])
+                with col_b1:
+                    if st.button("📥 로그에 추가하기", use_container_width=True):
+                        if bulk_text.strip():
+                            parsed_turns = parse_raw_text_to_turns(bulk_text)
+                            st.session_state.turns.extend(parsed_turns)
+                            st.success(f"총 {len(parsed_turns)}개의 발언이 로그에 추가되었습니다!")
+                            st.rerun()
+                        else:
+                            st.warning("붙여넣은 텍스트가 없습니다.")
+                with col_b2:
+                    if st.button("🔄 기존 로그 비우고 덮어쓰기", use_container_width=True):
+                        if bulk_text.strip():
+                            parsed_turns = parse_raw_text_to_turns(bulk_text)
+                            st.session_state.turns = parsed_turns
+                            st.success(f"{len(parsed_turns)}개의 발언으로 로그가 교체되었습니다!")
+                            st.rerun()
+                        else:
+                            st.warning("붙여넣은 텍스트가 없습니다.")
 
             st.markdown("##### 📜 실시간 누적 로그")
             if not st.session_state.turns:
                 st.info("아직 입력된 발언이 없습니다.")
             else:
-                log_box = st.container(height=300)
+                c_clear, _ = st.columns([3, 7])
+                if c_clear.button("전체 로그 초기화", use_container_width=True):
+                    st.session_state.turns = []
+                    st.rerun()
+
+                log_box = st.container(height=260)
                 for idx, turn in enumerate(st.session_state.turns):
                     with log_box:
                         r1, r2 = st.columns([9, 1])
@@ -503,10 +584,7 @@ def main():
                 else:
                     with st.spinner("LLM 분석 및 Supabase 클라우드 저장 중..."):
                         try:
-                            # brotli 디코더 충돌 방지용 헤더 강제 주입
-                            custom_http_client = httpx.Client(
-                                headers={"Accept-Encoding": "gzip, deflate"}
-                            )
+                            custom_http_client = httpx.Client(headers={"Accept-Encoding": "gzip, deflate"})
                             client = OpenAI(api_key=api_key, http_client=custom_http_client)
 
                             turns_log = "\n".join([f"{t['speaker']}: {t['content']}" for t in st.session_state.turns])
@@ -532,7 +610,6 @@ def main():
                                 f"[순수 발언 로그]:\n{turns_log}"
                             )
 
-                            # create + json_object 표준 모드 호출
                             response = client.chat.completions.create(
                                 model=model_name,
                                 messages=[
@@ -547,7 +624,6 @@ def main():
                             parsed = StructuredMeetingNote.model_validate_json(raw_json)
                             md_output = render_to_markdown(parsed)
 
-                            # Supabase 클라우드 저장
                             record_id = save_meeting_to_supabase(
                                 title=parsed.meeting_title,
                                 meeting_date=parsed.meeting_date.strftime('%Y-%m-%d'),
