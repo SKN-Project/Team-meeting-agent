@@ -30,7 +30,7 @@ FIXED_MEMBER_POOL = ["오호민", "신가을", "이준희", "김영석", "송지
 
 
 # =========================================================
-# 1. Pydantic 스키마 정의
+# 1. Pydantic 스키마 정의 (상태 및 메모 필드 확장)
 # =========================================================
 class PreviousContext(BaseModel):
     past_decisions_summary: Optional[str] = Field(default=None, description="이전 회의 주요 결정 사항")
@@ -51,9 +51,11 @@ class AgendaTopic(BaseModel):
 
 
 class ActionItem(BaseModel):
+    status: str = Field(default="❌ 미진행", description="진행 상태 ('❌ 미진행', '⏳ 진행중', '✅ 완료' 중 하나, 기본값은 '❌ 미진행')")
     task: str = Field(description="실행 과제 내용")
     owner: str = Field(description="담당자 이름 (언급 없을 시 '미지정')")
     due_date: Optional[date] = Field(default=None, description="마감 기한 (YYYY-MM-DD)")
+    memo: str = Field(default="", description="해당 과제에 대한 전달사항, 메모 또는 진행 참고 내용")
 
 
 class NextMeetingPlan(BaseModel):
@@ -80,7 +82,6 @@ def get_db_engine():
     db_url = os.getenv("DATABASE_URL")
     if not db_url:
         return None
-    # SQLAlchemy 드라이버 URI 보정
     if db_url.startswith("postgres://"):
         db_url = db_url.replace("postgres://", "postgresql+psycopg://", 1)
     elif db_url.startswith("postgresql://") and "+psycopg" not in db_url and "+psycopg2" not in db_url:
@@ -89,12 +90,12 @@ def get_db_engine():
 
 
 def save_meeting_to_supabase(
-    title: str,
-    meeting_date: str,
-    participants: List[str],
-    raw_turns: List[dict],
-    structured_note: StructuredMeetingNote,
-    markdown_text: str
+        title: str,
+        meeting_date: str,
+        participants: List[str],
+        raw_turns: List[dict],
+        structured_note: StructuredMeetingNote,
+        markdown_text: str
 ) -> Optional[int]:
     """Supabase PostgreSQL에 회의록 신규 저장"""
     engine = get_db_engine()
@@ -103,12 +104,11 @@ def save_meeting_to_supabase(
 
     with engine.connect() as conn:
         stmt = text("""
-            INSERT INTO meeting_records (
-                title, meeting_date, participants, raw_turns, structured_json, markdown_text
-            ) VALUES (
-                :title, :meeting_date, :participants, :raw_turns, :structured_json, :markdown_text
-            ) RETURNING id;
-        """)
+                    INSERT INTO meeting_records (title, meeting_date, participants, raw_turns, structured_json,
+                                                 markdown_text)
+                    VALUES (:title, :meeting_date, :participants, :raw_turns, :structured_json,
+                            :markdown_text) RETURNING id;
+                    """)
         result = conn.execute(stmt, {
             "title": title,
             "meeting_date": meeting_date,
@@ -132,6 +132,57 @@ def update_meeting_markdown(meeting_id: int, new_markdown: str):
         conn.commit()
 
 
+def update_action_items_batch(updates_by_meeting_id: dict):
+    """과제 현황판에서 편집된 상태 및 메모를 원본 JSON과 마크다운에 일괄 동기화 반영"""
+    engine = get_db_engine()
+    if not engine:
+        return
+
+    with engine.connect() as conn:
+        for meeting_id, updated_items in updates_by_meeting_id.items():
+            stmt = text("SELECT structured_json FROM meeting_records WHERE id = :id;")
+            row = conn.execute(stmt, {"id": meeting_id}).fetchone()
+            if not row:
+                continue
+
+            raw_val = row[0]
+            s_data = json.loads(raw_val) if isinstance(raw_val, str) else raw_val
+
+            # 항목 덮어쓰기
+            s_data["action_items"] = updated_items
+
+            # 갱신된 JSON 기반 마크다운 재생성
+            try:
+                note_obj = StructuredMeetingNote.model_validate(s_data)
+                new_md = render_to_markdown(note_obj)
+            except Exception:
+                new_md = None
+
+            if new_md:
+                upd_stmt = text("""
+                                UPDATE meeting_records
+                                SET structured_json = :sj,
+                                    markdown_text   = :md
+                                WHERE id = :id;
+                                """)
+                conn.execute(upd_stmt, {
+                    "sj": json.dumps(s_data, ensure_ascii=False),
+                    "md": new_md,
+                    "id": meeting_id
+                })
+            else:
+                upd_stmt = text("""
+                                UPDATE meeting_records
+                                SET structured_json = :sj
+                                WHERE id = :id;
+                                """)
+                conn.execute(upd_stmt, {
+                    "sj": json.dumps(s_data, ensure_ascii=False),
+                    "id": meeting_id
+                })
+        conn.commit()
+
+
 def delete_meeting_from_supabase(meeting_id: int):
     """특정 회의록 DB 영구 삭제"""
     engine = get_db_engine()
@@ -150,10 +201,17 @@ def get_all_meetings_from_supabase() -> List[dict]:
         return []
     with engine.connect() as conn:
         stmt = text("""
-            SELECT id, title, meeting_date, participants, raw_turns, structured_json, markdown_text, created_at
-            FROM meeting_records
-            ORDER BY meeting_date DESC, id DESC;
-        """)
+                    SELECT id,
+                           title,
+                           meeting_date,
+                           participants,
+                           raw_turns,
+                           structured_json,
+                           markdown_text,
+                           created_at
+                    FROM meeting_records
+                    ORDER BY meeting_date DESC, id DESC;
+                    """)
         result = conn.execute(stmt)
         return [dict(row._mapping) for row in result]
 
@@ -180,7 +238,9 @@ def format_past_meeting_as_context(structured_json_str: str) -> str:
 
         action_list = []
         for act in data.get("action_items", []):
-            action_list.append(f"{act.get('task')} (담당: {act.get('owner')})")
+            st_mark = act.get("status", "❌ 미진행")
+            memo_str = f" (메모: {act.get('memo')})" if act.get('memo') else ""
+            action_list.append(f"{st_mark} {act.get('task')} (담당: {act.get('owner')}){memo_str}")
 
         open_issues = []
         for topic in data.get("agenda_topics", []):
@@ -191,7 +251,7 @@ def format_past_meeting_as_context(structured_json_str: str) -> str:
         if decisions_list:
             context_lines.append("[지난 회의 주요 결정 사항]\n" + "\n".join(f"- {d}" for d in decisions_list))
         if action_list:
-            context_lines.append("[지난 회의 과제 현황]\n" + "\n".join(f"- {a}" for a in action_list))
+            context_lines.append("[지난 회의 과제 현황 및 진행 상태]\n" + "\n".join(f"- {a}" for a in action_list))
         if open_issues:
             context_lines.append("[지난 회의 미결 과제]\n" + "\n".join(f"- {o}" for o in open_issues))
 
@@ -234,7 +294,7 @@ def parse_raw_text_to_turns(raw_text: str) -> List[dict]:
 
 
 # =========================================================
-# 4. 마크다운 변환 렌더러
+# 4. 마크다운 변환 렌더러 (상태 및 메모 컬럼 표기)
 # =========================================================
 def render_to_markdown(note: StructuredMeetingNote) -> str:
     lines = []
@@ -300,12 +360,13 @@ def render_to_markdown(note: StructuredMeetingNote) -> str:
 
     lines.append("## 5. 실행 과제 (Action Items)")
     if note.action_items:
-        lines.append("| 번호 | 작업 내용 (Task) | 담당자 (Owner) | 마감 기한 (Due Date) |")
-        lines.append("| :---: | :--- | :---: | :---: |")
+        lines.append("| 상태 | 번호 | 작업 내용 (Task) | 담당자 (Owner) | 마감 기한 (Due Date) | 메모 (Memo) |")
+        lines.append("| :---: | :---: | :--- | :---: | :---: | :--- |")
         for idx, item in enumerate(note.action_items, 1):
             due = item.due_date.strftime("%Y-%m-%d") if item.due_date else "미지정"
             s_task = item.task.replace("\n", " ").replace("|", "\\|")
-            lines.append(f"| {idx} | {s_task} | {item.owner} | {due} |")
+            s_memo = (item.memo or "-").replace("\n", " ").replace("|", "\\|")
+            lines.append(f"| {item.status} | {idx} | {s_task} | {item.owner} | {due} | {s_memo} |")
     else:
         lines.append("- *도출된 액션 아이템이 없습니다.*")
     lines.append("\n---\n")
@@ -327,7 +388,7 @@ def render_to_markdown(note: StructuredMeetingNote) -> str:
 
 
 # =========================================================
-# 5. 한글 PDF 생성 엔진 (CDN 한글 폰트 자동 탑재)
+# 5. 한글 PDF 생성 엔진 (상태 뱃지 및 메모 테이블 반영)
 # =========================================================
 def get_korean_font_name() -> str:
     font_name = "NanumGothic"
@@ -359,14 +420,17 @@ def generate_pdf_bytes(note: StructuredMeetingNote) -> bytes:
     font_name = get_korean_font_name()
 
     doc = SimpleDocTemplate(
-        buffer, pagesize=A4, rightMargin=36, leftMargin=36, topMargin=40, bottomMargin=40
+        buffer, pagesize=A4, rightMargin=30, leftMargin=30, topMargin=36, bottomMargin=36
     )
     elements = []
 
     styles = getSampleStyleSheet()
-    title_style = ParagraphStyle('DocTitle', parent=styles['Heading1'], fontName=font_name, fontSize=18, leading=22, textColor=colors.HexColor("#1A202C"))
-    h2_style = ParagraphStyle('SectionH2', parent=styles['Heading2'], fontName=font_name, fontSize=12, leading=16, textColor=colors.HexColor("#2B6CB0"), spaceBefore=10, spaceAfter=6)
-    body_style = ParagraphStyle('BodyKR', parent=styles['Normal'], fontName=font_name, fontSize=9, leading=13, textColor=colors.HexColor("#2D3748"))
+    title_style = ParagraphStyle('DocTitle', parent=styles['Heading1'], fontName=font_name, fontSize=18, leading=22,
+                                 textColor=colors.HexColor("#1A202C"))
+    h2_style = ParagraphStyle('SectionH2', parent=styles['Heading2'], fontName=font_name, fontSize=12, leading=16,
+                              textColor=colors.HexColor("#2B6CB0"), spaceBefore=10, spaceAfter=6)
+    body_style = ParagraphStyle('BodyKR', parent=styles['Normal'], fontName=font_name, fontSize=8.5, leading=12,
+                                textColor=colors.HexColor("#2D3748"))
     bold_style = ParagraphStyle('BoldKR', parent=body_style, fontName=font_name, textColor=colors.HexColor("#1A202C"))
 
     elements.append(Paragraph(f"{note.meeting_title} 회의록", title_style))
@@ -377,7 +441,7 @@ def generate_pdf_bytes(note: StructuredMeetingNote) -> bytes:
         [Paragraph("<b>참석자</b>", bold_style), Paragraph(", ".join(note.participants), body_style)],
         [Paragraph("<b>회의 목적</b>", bold_style), Paragraph(note.meeting_objective, body_style)]
     ]
-    t_overview = Table(overview_data, colWidths=[80, 440])
+    t_overview = Table(overview_data, colWidths=[80, 455])
     t_overview.setStyle(TableStyle([
         ('BACKGROUND', (0, 0), (-1, -1), colors.HexColor("#F7FAFC")),
         ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor("#E2E8F0")),
@@ -406,11 +470,25 @@ def generate_pdf_bytes(note: StructuredMeetingNote) -> bytes:
 
     elements.append(Paragraph("실행 과제 (Action Items)", h2_style))
     if note.action_items:
-        act_data = [[Paragraph("<b>No</b>", bold_style), Paragraph("<b>작업 내용</b>", bold_style), Paragraph("<b>담당자</b>", bold_style), Paragraph("<b>마감일</b>", bold_style)]]
+        act_data = [[
+            Paragraph("<b>상태</b>", bold_style),
+            Paragraph("<b>No</b>", bold_style),
+            Paragraph("<b>작업 내용</b>", bold_style),
+            Paragraph("<b>담당자</b>", bold_style),
+            Paragraph("<b>마감일</b>", bold_style),
+            Paragraph("<b>메모</b>", bold_style)
+        ]]
         for idx, item in enumerate(note.action_items, 1):
             due = item.due_date.strftime("%Y-%m-%d") if item.due_date else "미지정"
-            act_data.append([Paragraph(str(idx), body_style), Paragraph(item.task, body_style), Paragraph(item.owner, body_style), Paragraph(due, body_style)])
-        t_act = Table(act_data, colWidths=[30, 310, 80, 100])
+            act_data.append([
+                Paragraph(item.status, body_style),
+                Paragraph(str(idx), body_style),
+                Paragraph(item.task, body_style),
+                Paragraph(item.owner, body_style),
+                Paragraph(due, body_style),
+                Paragraph(item.memo or "-", body_style)
+            ])
+        t_act = Table(act_data, colWidths=[55, 25, 190, 60, 65, 140])
         t_act.setStyle(TableStyle([
             ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor("#EDF2F7")),
             ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor("#CBD5E0")),
@@ -582,12 +660,14 @@ def main():
 
                             turns_log = "\n".join([f"{t['speaker']}: {t['content']}" for t in st.session_state.turns])
                             system_prompt = (
-                                "당신은 순수 대화 로그를 분석하여 공식 회의록을 작성하는 전문 비즈니스 AI입니다.\n"
-                                "1. 발언의 내용과 문맥을 읽고 제안, 반박, 동의 여부를 파악하십시오.\n"
-                                "2. 화자 간 상호작용 맥락을 추적하여 [화자별 핵심 의견] 및 [안건 논의 배경]에 반영하십시오.\n"
-                                "3. 합의된 사항은 [결정 사항], 이견이 남은 사항은 [미결 과제]로 분류하십시오.\n"
-                                "4. 일자는 YYYY-MM-DD 형식만 추출하고, 없는 사실은 임의로 지어내지 마십시오.\n"
-                                f"반드시 아래 JSON 스키마를 엄격히 준수하십시오:\n{json.dumps(StructuredMeetingNote.model_json_schema(), ensure_ascii=False)}"
+                                "당신은 대화 로그를 분석하여 공식 회의록을 작성하는 전문 비즈니스 AI입니다.\n"
+                                "1. 발언의 문맥을 분석하여 [화자별 핵심 의견], [안건 논의 배경]을 정밀 도출하십시오.\n"
+                                "2. 합의된 사항은 [결정 사항], 이견이 남거나 보류된 사항은 [미결 과제]로 구분하십시오.\n"
+                                "3. 액션 아이템(action_items) 도출 시:\n"
+                                "   - status는 기본값인 '❌ 미진행'으로 설정하십시오.\n"
+                                "   - memo는 대화 중 해당 과제와 관련해 특별히 언급된 유의사항이나 참고사항이 있다면 작성하고, 없으면 빈 문자열('')로 두십시오.\n"
+                                "4. 일자는 반드시 YYYY-MM-DD 형식만 추출하며, 대화에 없는 내용은 절대 지어내지 마십시오.\n\n"
+                                f"반드시 아래 JSON 스키마를 엄격히 준수하여 응답하십시오:\n{json.dumps(StructuredMeetingNote.model_json_schema(), ensure_ascii=False)}"
                             )
                             user_prompt = (
                                 f"[회의 개요]\n- 제목: {m_title}\n- 일자: {m_date.strftime('%Y-%m-%d')}\n"
@@ -598,7 +678,8 @@ def main():
 
                             response = client.chat.completions.create(
                                 model=model_name,
-                                messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
+                                messages=[{"role": "system", "content": system_prompt},
+                                          {"role": "user", "content": user_prompt}],
                                 response_format={"type": "json_object"},
                                 temperature=0.1
                             )
@@ -646,12 +727,10 @@ def main():
                 except Exception as p_err:
                     col_d2.error(f"PDF 생성 오류: {p_err}")
 
-                # 4번 기능: 메신저 전송을 위한 1클릭 복사용 코드박스
-                with st.expander("📋 메신저(슬랙/디스코드/카톡) 공유용 마크다운 복사하기 (클릭하여 펼치기)"):
-                    st.caption("우측 상단 복사 아이콘을 누르면 전체 마크다운이 클립보드에 복사됩니다.")
+                with st.expander("📋 메신저 공유용 마크다운 복사하기"):
+                    st.caption("우측 상단 복사 아이콘을 누르면 클립보드에 복사됩니다.")
                     st.code(st.session_state.markdown_output, language="markdown")
 
-                # 3번 기능: 생성 후 직접 수정 및 DB 업데이트
                 edit_mode = st.toggle("✏️ 마크다운 직접 수정 모드", key="toggle_edit_new")
                 if edit_mode:
                     edited_md = st.text_area("마크다운 내용 편집", value=st.session_state.markdown_output, height=500)
@@ -677,7 +756,6 @@ def main():
         if not all_meetings:
             st.info("저장된 회의록이 없습니다. 새 회의를 먼저 작성해 보세요.")
         else:
-            # 1번 기능: 다각도 검색 및 필터 UI
             with st.expander("🔍 회의록 검색 및 필터링 옵션", expanded=True):
                 f_c1, f_c2, f_c3 = st.columns([4, 3, 3])
                 with f_c1:
@@ -692,19 +770,15 @@ def main():
                     else:
                         d_range = None
 
-            # 필터링 로직
             filtered = []
             for m in all_meetings:
-                # 키워드 검색
                 m_full_text = f"{m['title']} {m['markdown_text']} {m.get('participants', '')}".lower()
                 if search_kw.strip() and search_kw.strip().lower() not in m_full_text:
                     continue
-                # 참석자 필터
                 if filter_member:
                     m_parts = json.loads(m['participants']) if isinstance(m['participants'], str) else m['participants']
                     if not any(mem in m_parts for mem in filter_member):
                         continue
-                # 날짜 범위 필터
                 if use_date_filter and isinstance(d_range, tuple) and len(d_range) == 2:
                     try:
                         m_dt = datetime.strptime(m['meeting_date'], "%Y-%m-%d").date()
@@ -738,18 +812,19 @@ def main():
                             st.success("맥락 복사 완료! [새 회의 작성] 탭에서 확인하세요.")
 
                         st.markdown("---")
-                        # 5번 기능: 회의록 영구 삭제
                         st.markdown("##### ⚠️ 회의록 관리")
                         with st.expander("🗑️ 이 회의록 삭제하기"):
                             st.warning("삭제 시 Supabase에서 영구히 제거됩니다.")
                             confirm_del = st.checkbox("정말로 이 회의록을 삭제하시겠습니까?", key=f"chk_del_{detail['id']}")
-                            if st.button("삭제 실행", type="primary", disabled=not confirm_del, key=f"btn_del_{detail['id']}"):
+                            if st.button("삭제 실행", type="primary", disabled=not confirm_del,
+                                         key=f"btn_del_{detail['id']}"):
                                 delete_meeting_from_supabase(detail['id'])
                                 st.success("회의록이 삭제되었습니다.")
                                 st.rerun()
 
                         with st.expander("🔍 원본 발언 로그 보기"):
-                            raw_data = detail['raw_turns'] if isinstance(detail['raw_turns'], list) else json.loads(detail['raw_turns'])
+                            raw_data = detail['raw_turns'] if isinstance(detail['raw_turns'], list) else json.loads(
+                                detail['raw_turns'])
                             for r in raw_data:
                                 st.write(f"- **{r['speaker']}**: {r['content']}")
 
@@ -767,7 +842,9 @@ def main():
                             use_container_width=True
                         )
                         try:
-                            note_dict = detail['structured_json'] if isinstance(detail['structured_json'], dict) else json.loads(detail['structured_json'])
+                            note_dict = detail['structured_json'] if isinstance(detail['structured_json'],
+                                                                                dict) else json.loads(
+                                detail['structured_json'])
                             note_obj = StructuredMeetingNote.model_validate(note_dict)
                             pdf_data = generate_pdf_bytes(note_obj)
                             d_c2.download_button(
@@ -781,14 +858,13 @@ def main():
                         except Exception as h_pe:
                             d_c2.caption(f"PDF 생성 불가: {h_pe}")
 
-                        # 4번 기능: 메신저 복사용 코드창
                         with st.expander("📋 메신저 공유용 마크다운 복사하기"):
                             st.code(detail['markdown_text'], language="markdown")
 
-                        # 3번 기능: 보관함 회의록 직접 수정 및 DB 업데이트
                         edit_hist_mode = st.toggle("✏️ 마크다운 편집 모드", key=f"edit_hist_mode_{detail['id']}")
                         if edit_hist_mode:
-                            hist_edited_text = st.text_area("마크다운 내용 편집", value=detail['markdown_text'], height=500, key=f"area_edit_{detail['id']}")
+                            hist_edited_text = st.text_area("마크다운 내용 편집", value=detail['markdown_text'], height=500,
+                                                            key=f"area_edit_{detail['id']}")
                             if st.button("💾 수정한 내용 DB에 즉시 갱신", type="primary", key=f"save_edit_{detail['id']}"):
                                 update_meeting_markdown(detail['id'], hist_edited_text)
                                 st.success("수정 사항이 Supabase에 업데이트되었습니다!")
@@ -799,26 +875,35 @@ def main():
                                 st.markdown(detail['markdown_text'])
 
     # -----------------------------------------------------
-    # TAB 3: 팀 과제(Action Items) 통합 대시보드 (2번 기능)
+    # TAB 3: 팀 과제(Action Items) 현황판 (상태 토글 및 메모 작성)
     # -----------------------------------------------------
     with tab_actions:
         st.subheader("📌 팀 과제(Action Items) 현황판")
-        st.caption("Supabase에 저장된 모든 회의록에서 도출된 액션 아이템을 실시간 집계합니다.")
+        st.caption("표에서 상태(❌ / ⏳ / ✅)와 메모를 직접 수정한 뒤 하단의 '💾 상태 및 메모 변경사항 저장'을 누르면 DB에 즉시 반영됩니다.")
 
         all_records = get_all_meetings_from_supabase()
         aggregated_items = []
 
         for rec in all_records:
             try:
-                s_data = rec['structured_json'] if isinstance(rec['structured_json'], dict) else json.loads(rec['structured_json'])
-                for item in s_data.get("action_items", []):
+                s_data = rec['structured_json'] if isinstance(rec['structured_json'], dict) else json.loads(
+                    rec['structured_json'])
+                for idx, item in enumerate(s_data.get("action_items", [])):
+                    # 기본 상태 엑스(❌ 미진행) 처리
+                    st_val = item.get("status") or "❌ 미진행"
+                    if st_val not in ["❌ 미진행", "⏳ 진행중", "✅ 완료"]:
+                        st_val = "❌ 미진행"
+
                     aggregated_items.append({
-                        "회의 일자": rec['meeting_date'],
-                        "회의 제목": rec['title'],
+                        "_meeting_id": rec['id'],
+                        "_item_idx": idx,
+                        "상태": st_val,
                         "담당자": item.get("owner", "미지정"),
                         "실행 과제 (Task)": item.get("task", ""),
-                        "마감 기한": item.get("due_date") or "기한 없음",
-                        "회의 ID": rec['id']
+                        "마감 기한": str(item.get("due_date")) if item.get("due_date") else "기한 없음",
+                        "메모": item.get("memo", ""),
+                        "출처 회의": rec['title'],
+                        "회의 일자": rec['meeting_date']
                     })
             except Exception:
                 continue
@@ -828,28 +913,71 @@ def main():
         else:
             df_tasks = pd.DataFrame(aggregated_items)
 
-            # 담당자 필터
-            col_f1, col_f2 = st.columns([4, 6])
-            with col_f1:
-                owner_filter = st.selectbox("담당자별 필터링", options=["전체 팀원 보기"] + FIXED_MEMBER_POOL + ["미지정"])
+            # 필터링 및 상태별 집계 메트릭
+            f_col1, f_col2, f_col3, f_col4 = st.columns([3, 2, 2, 2])
+            with f_col1:
+                owner_filter = st.selectbox("담당자별 필터링", options=["전체 팀원 보기"] + FIXED_MEMBER_POOL + ["미지정"],
+                                            key="filter_owner_actions")
 
             filtered_df = df_tasks if owner_filter == "전체 팀원 보기" else df_tasks[df_tasks["담당자"] == owner_filter]
 
-            # 통계 메트릭 표시
-            total_cnt = len(filtered_df)
-            st.metric(label="총 할 일 건수", value=f"{total_cnt}건")
+            with f_col2:
+                cnt_x = len(filtered_df[filtered_df["상태"] == "❌ 미진행"])
+                st.metric("❌ 미진행", f"{cnt_x}건")
+            with f_col3:
+                cnt_p = len(filtered_df[filtered_df["상태"] == "⏳ 진행중"])
+                st.metric("⏳ 진행중", f"{cnt_p}건")
+            with f_col4:
+                cnt_d = len(filtered_df[filtered_df["상태"] == "✅ 완료"])
+                st.metric("✅ 완료", f"{cnt_d}건")
 
-            st.dataframe(
+            st.markdown("---")
+
+            # 인터랙티브 데이터 에디터 (상태는 드롭다운, 메모는 텍스트 입력)
+            edited_df = st.data_editor(
                 filtered_df,
                 column_config={
-                    "마감 기한": st.column_config.TextColumn("마감 기한 (Due Date)"),
-                    "실행 과제 (Task)": st.column_config.TextColumn("작업 내용", width="large"),
-                    "담당자": st.column_config.TextColumn("담당자", width="small"),
-                    "회의 제목": st.column_config.TextColumn("출처 회의"),
+                    "_meeting_id": None,  # 숨김 컬럼
+                    "_item_idx": None,  # 숨김 컬럼
+                    "상태": st.column_config.SelectboxColumn(
+                        "상태 (클릭 변경)",
+                        options=["❌ 미진행", "⏳ 진행중", "✅ 완료"],
+                        required=True,
+                        width="small"
+                    ),
+                    "담당자": st.column_config.TextColumn("담당자", disabled=True, width="small"),
+                    "실행 과제 (Task)": st.column_config.TextColumn("실행 과제 (Task)", disabled=True, width="large"),
+                    "마감 기한": st.column_config.TextColumn("마감 기한", disabled=True, width="small"),
+                    "메모": st.column_config.TextColumn("메모 / 코멘트 (더블클릭하여 작성)", width="large"),
+                    "출처 회의": st.column_config.TextColumn("출처 회의", disabled=True),
+                    "회의 일자": st.column_config.TextColumn("회의 일자", disabled=True),
                 },
                 hide_index=True,
-                use_container_width=True
+                use_container_width=True,
+                key="action_items_interactive_editor"
             )
+
+            # 변경사항 DB 일괄 저장 버튼
+            if st.button("💾 상태 및 메모 변경사항 DB에 일괄 저장", type="primary", use_container_width=True):
+                # meeting_id별로 업데이트 대상 그룹화
+                updates_map = {}
+                for rec in all_records:
+                    s_data = rec['structured_json'] if isinstance(rec['structured_json'], dict) else json.loads(
+                        rec['structured_json'])
+                    updates_map[rec['id']] = list(s_data.get("action_items", []))
+
+                # 사용자가 편집한 내용 반영
+                for _, row in edited_df.iterrows():
+                    m_id = row["_meeting_id"]
+                    idx = int(row["_item_idx"])
+                    if m_id in updates_map and idx < len(updates_map[m_id]):
+                        updates_map[m_id][idx]["status"] = row["상태"]
+                        updates_map[m_id][idx]["memo"] = str(row["메모"]).strip() if pd.notna(row["메모"]) else ""
+
+                # Supabase 일괄 업데이트 실행
+                update_action_items_batch(updates_map)
+                st.success("모든 과제의 진행 상태와 메모가 Supabase DB에 안전하게 저장되었습니다!")
+                st.rerun()
 
 
 if __name__ == "__main__":
