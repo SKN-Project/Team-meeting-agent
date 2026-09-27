@@ -91,7 +91,7 @@ def get_db_engine():
 
 
 def init_db():
-    """상시 과제 전용 테이블 자동 생성 (최초 1회 실행)"""
+    """상시 과제 전용 테이블 자동 생성"""
     engine = get_db_engine()
     if not engine:
         return
@@ -126,7 +126,7 @@ def init_db():
 
 @st.cache_data(ttl=60)
 def get_all_meetings_from_supabase() -> List[dict]:
-    """저장된 전체 회의록 목록 조회 (TTL 60초 캐싱)"""
+    """저장된 전체 회의록 목록 조회 (최신 일자순)"""
     engine = get_db_engine()
     if not engine:
         return []
@@ -242,15 +242,12 @@ def update_meeting_markdown(meeting_id: int, new_markdown: str):
 
 
 def update_action_items_unified(meeting_targets: List[dict], standalone_targets: List[dict]):
-    """
-    회의 과제와 상시 과제를 각각 원자적으로 안전 갱신하여 동시성 덮어쓰기를 방지합니다.
-    """
+    """회의 과제와 상시 과제를 각각 원자적으로 안전 갱신"""
     engine = get_db_engine()
     if not engine:
         return
 
     with engine.connect() as conn:
-        # 1. 회의 과제 개별 반영
         if meeting_targets:
             grouped = {}
             for item in meeting_targets:
@@ -300,7 +297,6 @@ def update_action_items_unified(meeting_targets: List[dict], standalone_targets:
                         "id": m_id
                     })
 
-        # 2. 상시 과제 개별 반영
         if standalone_targets:
             for st_item in standalone_targets:
                 upd_st = text("""
@@ -427,7 +423,8 @@ def render_to_markdown(note: StructuredMeetingNote) -> str:
     lines.append("---\n")
 
     lines.append("## 2. 이전 회의 팔로업 (Previous Context)")
-    if note.previous_context:
+    if note.previous_context and (
+            note.previous_context.past_decisions_summary or note.previous_context.action_item_updates):
         past = note.previous_context.past_decisions_summary or "기록된 이전 결정 사항 없음"
         lines.append(f"- **지난 회의 주요 결정 사항**: {past}")
         lines.append("- **지난 액션 아이템 진행 상태**:")
@@ -637,7 +634,17 @@ def main():
         except Exception:
             pass
 
-    # 세션 상태 초기화
+    # DB에 저장된 회의록 목록 선행 조회
+    all_existing_meetings = get_all_meetings_from_supabase()
+
+    # 세션 상태 초기화: 저장된 회의가 있다면 가장 최신 회의 맥락을 기본값으로 자동 로드
+    if "prev_context_buffer" not in st.session_state:
+        if all_existing_meetings:
+            st.session_state.prev_context_buffer = format_past_meeting_as_context(
+                all_existing_meetings[0]['structured_json'])
+        else:
+            st.session_state.prev_context_buffer = ""
+
     if "turns" not in st.session_state:
         st.session_state.turns = []
     if "generated_note" not in st.session_state:
@@ -646,8 +653,6 @@ def main():
         st.session_state.markdown_output = None
     if "current_record_id" not in st.session_state:
         st.session_state.current_record_id = None
-    if "prev_context_buffer" not in st.session_state:
-        st.session_state.prev_context_buffer = ""
     if "action_status_card_filter" not in st.session_state:
         st.session_state.action_status_card_filter = "전체"
 
@@ -680,7 +685,7 @@ def main():
     ])
 
     # -----------------------------------------------------
-    # TAB 1: 새 회의 작성 및 정리
+    # TAB 1: 새 회의 작성 및 정리 (직전 회의 맥락 자동 연동)
     # -----------------------------------------------------
     with tab_new:
         left_col, right_col = st.columns([5, 5])
@@ -699,11 +704,48 @@ def main():
                     default=FIXED_MEMBER_POOL
                 )
 
+            # 이전 회의 자동 연동 및 선택 영역
+            st.markdown("##### 🔗 이전 회의 팔로업 연동")
+            if all_existing_meetings:
+                ctx_choices = {}
+                for m in all_existing_meetings:
+                    is_latest = (m['id'] == all_existing_meetings[0]['id'])
+                    tag = " (최근 회의 / 자동 선택됨)" if is_latest else ""
+                    ctx_choices[f"[{m['meeting_date']}] {m['title']}{tag}"] = m['id']
+                ctx_choices["연동 안 함 (새 프로젝트 회의)"] = None
+
+                c_sel, c_btn = st.columns([7, 3])
+                with c_sel:
+                    chosen_ctx_label = st.selectbox(
+                        "연동할 이전 회의 선택",
+                        options=list(ctx_choices.keys()),
+                        index=0,
+                        help="선택한 회의의 결정 사항과 미결 과제가 아래 입력창에 즉시 주입됩니다."
+                    )
+                with c_btn:
+                    st.write("")
+                    st.write("")
+                    if st.button("🔄 맥락 다시 불러오기", use_container_width=True):
+                        target_id = ctx_choices[chosen_ctx_label]
+                        if target_id:
+                            m_target = get_meeting_by_id_from_supabase(target_id)
+                            if m_target:
+                                st.session_state.prev_context_buffer = format_past_meeting_as_context(
+                                    m_target['structured_json'])
+                                st.success("선택한 회의 맥락이 반영되었습니다!")
+                                st.rerun()
+                        else:
+                            st.session_state.prev_context_buffer = ""
+                            st.info("이전 맥락을 비웠습니다.")
+                            st.rerun()
+            else:
+                st.caption("ℹ️ DB에 등록된 이전 회의가 없습니다. (이번 회의가 첫 번째 회의로 기록됩니다)")
+
             prev_context_text = st.text_area(
-                "이전 회의 맥락 / 팔로업 (보관함에서 1클릭 복사 가능)",
+                "이전 회의 맥락 / 팔로업 (직전 회의 데이터가 자동 반영되어 있습니다)",
                 value=st.session_state.prev_context_buffer,
-                height=80,
-                placeholder="지난 회의 결정 사항이나 액션 아이템이 들어갑니다."
+                height=110,
+                placeholder="직전 회의 결정 사항 및 액션 아이템 내용이 자동으로 표시됩니다."
             )
             st.session_state.prev_context_buffer = prev_context_text
 
@@ -790,18 +832,20 @@ def main():
                             turns_log = "\n".join([f"{t['speaker']}: {t['content']}" for t in st.session_state.turns])
                             system_prompt = (
                                 "당신은 대화 로그를 분석하여 공식 회의록을 작성하는 전문 비즈니스 AI입니다.\n"
-                                "1. 발언의 문맥을 분석하여 [화자별 핵심 의견], [안건 논의 배경]을 정밀 도출하십시오.\n"
-                                "2. 합의된 사항은 [결정 사항], 이견이 남거나 보류된 사항은 [미결 과제]로 구분하십시오.\n"
-                                "3. 액션 아이템(action_items) 도출 시:\n"
+                                "1. [이전 회의 맥락]이 제공된 경우, 이전 회의의 결정 사항과 과제가 이번 회의에서 어떻게 다루어졌는지 파악하여 "
+                                "   [previous_context.past_decisions_summary]와 [previous_context.action_item_updates]에 구체적으로 정리하십시오.\n"
+                                "2. 발언의 문맥을 분석하여 [화자별 핵심 의견], [안건 논의 배경]을 정밀 도출하십시오.\n"
+                                "3. 합의된 사항은 [결정 사항], 이견이 남거나 보류된 사항은 [미결 과제]로 구분하십시오.\n"
+                                "4. 액션 아이템(action_items) 도출 시:\n"
                                 "   - status는 기본값인 '❌ 미진행'으로 설정하십시오.\n"
                                 "   - memo는 대화 중 해당 과제와 관련해 특별히 언급된 유의사항이나 참고사항이 있다면 작성하고, 없으면 빈 문자열('')로 두십시오.\n"
-                                "4. 일자는 반드시 YYYY-MM-DD 형식만 추출하며, 대화에 없는 내용은 절대 지어내지 마십시오.\n\n"
+                                "5. 일자는 반드시 YYYY-MM-DD 형식만 추출하며, 대화에 없는 내용은 절대 지어내지 마십시오.\n\n"
                                 f"반드시 아래 JSON 스키마를 엄격히 준수하여 응답하십시오:\n{json.dumps(StructuredMeetingNote.model_json_schema(), ensure_ascii=False)}"
                             )
                             user_prompt = (
                                 f"[회의 개요]\n- 제목: {m_title}\n- 일자: {m_date.strftime('%Y-%m-%d')}\n"
                                 f"- 참석자: {', '.join(selected_participants)}\n"
-                                f"- 이전 회의 맥락: {st.session_state.prev_context_buffer or '없음'}\n\n"
+                                f"- 이전 회의 맥락 (주입됨):\n{st.session_state.prev_context_buffer or '없음'}\n\n"
                                 f"[순수 발언 로그]:\n{turns_log}"
                             )
 
@@ -1004,17 +1048,16 @@ def main():
                                 st.markdown(detail['markdown_text'])
 
     # -----------------------------------------------------
-    # TAB 3: 팀 과제(Action Items) 현황판 (회의 과제 + 상시 과제 통합)
+    # TAB 3: 팀 과제(Action Items) 통합 현황판
     # -----------------------------------------------------
     with tab_actions:
         st.subheader("📌 팀 과제(Action Items) 통합 현황판")
-        st.caption("회의록에서 도출된 과제와 직접 등록한 상시 과제가 모두 모여 있습니다. 표에서 수정 후 '💾 저장'을 누르면 DB에 안전하게 반영됩니다.")
+        st.caption("회의록 과제와 상시 과제를 통합 관리합니다. 표에서 수정한 뒤 '💾 저장'을 누르면 DB에 안전하게 반영됩니다.")
 
         all_records = get_all_meetings_from_supabase()
         standalone_records = get_all_standalone_tasks_from_supabase()
         aggregated_items = []
 
-        # 1. 회의록 과제 적재
         for rec in all_records:
             try:
                 s_data = rec['structured_json'] if isinstance(rec['structured_json'], dict) else json.loads(
@@ -1051,7 +1094,6 @@ def main():
             except Exception:
                 continue
 
-        # 2. 상시 과제 적재
         for st_row in standalone_records:
             st_val = st_row.get("status") or "❌ 미진행"
             if st_val not in ["❌ 미진행", "⏳ 진행중", "✅ 완료"]:
@@ -1083,7 +1125,6 @@ def main():
         else:
             df_tasks = pd.DataFrame(aggregated_items)
 
-            # 1. 담당자 필터
             owner_filter = st.selectbox(
                 "👤 담당자 필터링",
                 options=["전체 팀원 보기"] + FIXED_MEMBER_POOL + ["미지정"],
@@ -1091,7 +1132,6 @@ def main():
             )
             base_df = df_tasks if owner_filter == "전체 팀원 보기" else df_tasks[df_tasks["담당자"] == owner_filter]
 
-            # 2. 상태 카드 버튼
             cnt_total = len(base_df)
             cnt_x = len(base_df[base_df["상태"] == "❌ 미진행"])
             cnt_p = len(base_df[base_df["상태"] == "⏳ 진행중"])
@@ -1137,7 +1177,6 @@ def main():
 
             st.markdown("---")
 
-            # 3. 데이터 에디터
             edited_df = st.data_editor(
                 display_df,
                 column_config={
@@ -1167,7 +1206,6 @@ def main():
                 key="action_items_interactive_editor"
             )
 
-            # 4. 일괄 저장 로직
             if st.button("💾 상태·기한·메모 변경사항 DB에 안전 저장", type="primary", use_container_width=True):
                 modified_meeting_targets = []
                 modified_standalone_targets = []
@@ -1218,16 +1256,15 @@ def main():
                 else:
                     update_action_items_unified(modified_meeting_targets, modified_standalone_targets)
                     total_mod = len(modified_meeting_targets) + len(modified_standalone_targets)
-                    st.success(
-                        f"총 {total_mod}건의 과제(회의 {len(modified_meeting_targets)}건, 상시 {len(modified_standalone_targets)}건)가 DB에 안전하게 반영되었습니다!")
+                    st.success(f"총 {total_mod}건의 과제가 DB에 안전하게 반영되었습니다!")
                     st.rerun()
 
     # -----------------------------------------------------
-    # TAB 4: 상시 과제 직접 등록 및 관리 (신규 기능)
+    # TAB 4: 상시 과제 직접 등록
     # -----------------------------------------------------
     with tab_standalone:
         st.subheader("➕ 상시 과제 직접 등록")
-        st.caption("정규 회의록 외에 일상 업무, 긴급 버그 수정, 개인 과제 등을 등록하여 팀 현황판에 공유합니다.")
+        st.caption("정규 회의록 외에 일상 업무, 긴급 버그 수정 등을 등록하여 팀 현황판에 공유합니다.")
 
         c_form, c_view = st.columns([5, 5])
 
