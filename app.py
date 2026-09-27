@@ -76,7 +76,7 @@ class StructuredMeetingNote(BaseModel):
 
 
 # =========================================================
-# 2. Supabase (PostgreSQL) 데이터베이스 연동 레이어 (캐싱 최적화)
+# 2. Supabase (PostgreSQL) 데이터베이스 연동 레이어
 # =========================================================
 @st.cache_resource
 def get_db_engine():
@@ -92,7 +92,7 @@ def get_db_engine():
 
 @st.cache_data(ttl=60)
 def get_all_meetings_from_supabase() -> List[dict]:
-    """저장된 전체 회의록 목록 조회 (TTL 60초 캐싱으로 투명 깜빡임 방지)"""
+    """저장된 전체 회의록 목록 조회 (캐싱을 통해 UI 깜빡임 방지)"""
     engine = get_db_engine()
     if not engine:
         return []
@@ -136,7 +136,7 @@ def save_meeting_to_supabase(
             "markdown_text": markdown_text
         })
         conn.commit()
-        st.cache_data.clear()  # 캐시 무효화
+        st.cache_data.clear()
         return result.scalar()
 
 
@@ -155,14 +155,12 @@ def update_meeting_markdown(meeting_id: int, new_markdown: str):
 def update_action_items_fine_grained(modified_items: List[dict]):
     """
     동시성 덮어쓰기 방지:
-    전체를 덮어쓰지 않고 변경된 항목들의 특정 meeting_id에 대해
-    최신 DB 데이터를 즉시 읽어온 뒤 해당 과제 항목만 부분 수정하여 커밋합니다.
+    상태, 메모뿐만 아니라 변경된 '마감 기한'까지 해당 회의의 최신 DB 레코드에 원자적 반영
     """
     engine = get_db_engine()
     if not engine or not modified_items:
         return
 
-    # meeting_id 단위로 변경점 묶기
     grouped = {}
     for item in modified_items:
         m_id = item["meeting_id"]
@@ -170,7 +168,6 @@ def update_action_items_fine_grained(modified_items: List[dict]):
 
     with engine.connect() as conn:
         for m_id, items in grouped.items():
-            # 저장 직전 최신 DB 상태 단건 조회
             stmt = text("SELECT structured_json FROM meeting_records WHERE id = :id;")
             row = conn.execute(stmt, {"id": m_id}).fetchone()
             if not row:
@@ -180,12 +177,12 @@ def update_action_items_fine_grained(modified_items: List[dict]):
             s_data = json.loads(raw_val) if isinstance(raw_val, str) else raw_val
             action_items = s_data.get("action_items", [])
 
-            # 특정 과제만 정밀 갱신
             for it in items:
                 idx = it["item_idx"]
                 if idx < len(action_items):
                     action_items[idx]["status"] = it["new_status"]
                     action_items[idx]["memo"] = it["new_memo"]
+                    action_items[idx]["due_date"] = it["new_due_date"]  # YYYY-MM-DD 또는 None
 
             s_data["action_items"] = action_items
 
@@ -251,8 +248,9 @@ def format_past_meeting_as_context(structured_json_str: str) -> str:
         action_list = []
         for act in data.get("action_items", []):
             st_mark = act.get("status", "❌ 미진행")
+            due_str = f" (~{act.get('due_date')})" if act.get('due_date') else ""
             memo_str = f" (메모: {act.get('memo')})" if act.get('memo') else ""
-            action_list.append(f"{st_mark} {act.get('task')} (담당: {act.get('owner')}){memo_str}")
+            action_list.append(f"{st_mark} {act.get('task')} (담당: {act.get('owner')}{due_str}){memo_str}")
 
         open_issues = []
         for topic in data.get("agenda_topics", []):
@@ -881,11 +879,11 @@ def main():
                                 st.markdown(detail['markdown_text'])
 
     # -----------------------------------------------------
-    # TAB 3: 팀 과제(Action Items) 현황판 (클릭 필터 및 동시성 방지)
+    # TAB 3: 팀 과제(Action Items) 현황판 (마감 기한 변경 가능)
     # -----------------------------------------------------
     with tab_actions:
         st.subheader("📌 팀 과제(Action Items) 현황판")
-        st.caption("상태 버튼을 클릭하여 원하는 과제만 필터링하고, 표에서 수정 후 '💾 저장'을 누르면 다른 팀원의 작업과 충돌 없이 안전하게 반영됩니다.")
+        st.caption("표에서 상태, 마감 기한(캘린더 클릭), 메모를 자유롭게 조정한 후 '💾 저장'을 누르면 DB에 안전하게 반영됩니다.")
 
         all_records = get_all_meetings_from_supabase()
         aggregated_items = []
@@ -898,13 +896,25 @@ def main():
                     if st_val not in ["❌ 미진행", "⏳ 진행중", "✅ 완료"]:
                         st_val = "❌ 미진행"
 
+                    # 마감 기한 날짜 객체 파싱
+                    raw_due = item.get("due_date")
+                    due_date_obj = None
+                    if raw_due:
+                        try:
+                            if isinstance(raw_due, (date, datetime)):
+                                due_date_obj = raw_due if isinstance(raw_due, date) else raw_due.date()
+                            else:
+                                due_date_obj = datetime.strptime(str(raw_due)[:10], "%Y-%m-%d").date()
+                        except Exception:
+                            due_date_obj = None
+
                     aggregated_items.append({
                         "_meeting_id": rec['id'],
                         "_item_idx": idx,
                         "상태": st_val,
                         "담당자": item.get("owner", "미지정"),
                         "실행 과제 (Task)": item.get("task", ""),
-                        "마감 기한": str(item.get("due_date")) if item.get("due_date") else "기한 없음",
+                        "마감 기한": due_date_obj,
                         "메모": item.get("memo", ""),
                         "출처 회의": rec['title'],
                         "회의 일자": rec['meeting_date']
@@ -925,7 +935,7 @@ def main():
             )
             base_df = df_tasks if owner_filter == "전체 팀원 보기" else df_tasks[df_tasks["담당자"] == owner_filter]
 
-            # 2. 클릭 가능한 인터랙티브 상태 카드 버튼 영역
+            # 2. 상태 카드 버튼
             cnt_total = len(base_df)
             cnt_x = len(base_df[base_df["상태"] == "❌ 미진행"])
             cnt_p = len(base_df[base_df["상태"] == "⏳ 진행중"])
@@ -960,7 +970,6 @@ def main():
                     st.session_state.action_status_card_filter = "✅ 완료"
                     st.rerun()
 
-            # 선택된 상태로 최종 필터링
             if st.session_state.action_status_card_filter == "전체":
                 display_df = base_df.copy()
             else:
@@ -968,7 +977,7 @@ def main():
 
             st.markdown("---")
 
-            # 3. 데이터 에디터 (상태 및 메모 편집)
+            # 3. 데이터 에디터 (마감 기한 DateColumn 활성화)
             edited_df = st.data_editor(
                 display_df,
                 column_config={
@@ -982,7 +991,11 @@ def main():
                     ),
                     "담당자": st.column_config.TextColumn("담당자", disabled=True, width="small"),
                     "실행 과제 (Task)": st.column_config.TextColumn("실행 과제 (Task)", disabled=True, width="large"),
-                    "마감 기한": st.column_config.TextColumn("마감 기한", disabled=True, width="small"),
+                    "마감 기한": st.column_config.DateColumn(
+                        "마감 기한 (더블클릭 변경)",
+                        format="YYYY-MM-DD",
+                        width="small"
+                    ),
                     "메모": st.column_config.TextColumn("메모 / 코멘트 (더블클릭 작성)", width="large"),
                     "출처 회의": st.column_config.TextColumn("출처 회의", disabled=True),
                     "회의 일자": st.column_config.TextColumn("회의 일자", disabled=True),
@@ -992,14 +1005,23 @@ def main():
                 key="action_items_interactive_editor"
             )
 
-            # 4. 동시성 충돌 방지 단건 부분 업데이트 저장 로직
-            if st.button("💾 상태 및 메모 변경사항 DB에 안전 저장", type="primary", use_container_width=True):
-                # 기존 원본과 비교하여 '실제로 바뀐 행(Diff)'만 탐색
+            # 4. 저장 시 마감 기한 변경사항까지 추적하여 안전 업데이트
+            if st.button("💾 상태·기한·메모 변경사항 DB에 안전 저장", type="primary", use_container_width=True):
                 modified_targets = []
                 orig_lookup = {
                     (item["_meeting_id"], item["_item_idx"]): item
                     for item in aggregated_items
                 }
+
+                def to_iso_date(val):
+                    if pd.isna(val) or val is None:
+                        return None
+                    if isinstance(val, (datetime, pd.Timestamp)):
+                        return val.strftime("%Y-%m-%d")
+                    if isinstance(val, date):
+                        return val.strftime("%Y-%m-%d")
+                    s = str(val).strip()
+                    return s if s else None
 
                 for _, row in edited_df.iterrows():
                     key = (row["_meeting_id"], row["_item_idx"])
@@ -1007,22 +1029,24 @@ def main():
                         orig = orig_lookup[key]
                         new_st = row["상태"]
                         new_mem = str(row["메모"]).strip() if pd.notna(row["메모"]) else ""
+                        new_due_str = to_iso_date(row["마감 기한"])
+                        orig_due_str = to_iso_date(orig["마감 기한"])
 
-                        # 상태나 메모 중 하나라도 달라진 경우만 업데이트 목록에 추가
-                        if (new_st != orig["상태"]) or (new_mem != orig["메모"]):
+                        # 상태, 메모, 마감 기한 중 하나라도 변경되었으면 대상에 등록
+                        if (new_st != orig["상태"]) or (new_mem != orig["메모"]) or (new_due_str != orig_due_str):
                             modified_targets.append({
                                 "meeting_id": row["_meeting_id"],
                                 "item_idx": int(row["_item_idx"]),
                                 "new_status": new_st,
-                                "new_memo": new_mem
+                                "new_memo": new_mem,
+                                "new_due_date": new_due_str
                             })
 
                 if not modified_targets:
                     st.info("변경된 내용이 없습니다.")
                 else:
-                    # 변경된 항목만 해당 회의록을 단건으로 열어 정밀 업데이트 (동시성 덮어쓰기 방지)
                     update_action_items_fine_grained(modified_targets)
-                    st.success(f"총 {len(modified_targets)}건의 과제 변경사항이 안전하게 저장되었습니다!")
+                    st.success(f"총 {len(modified_targets)}건의 과제(상태/기한/메모)가 DB에 안전하게 반영되었습니다!")
                     st.rerun()
 
 
