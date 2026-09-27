@@ -90,29 +90,119 @@ def get_db_engine():
     return create_engine(db_url, pool_pre_ping=True, pool_size=5, max_overflow=10)
 
 
+def init_db():
+    """상시 과제 전용 테이블 자동 생성 (최초 1회 실행)"""
+    engine = get_db_engine()
+    if not engine:
+        return
+    with engine.connect() as conn:
+        conn.execute(text("""
+                          CREATE TABLE IF NOT EXISTS standalone_tasks
+                          (
+                              id
+                              BIGSERIAL
+                              PRIMARY
+                              KEY,
+                              task
+                              TEXT
+                              NOT
+                              NULL,
+                              owner
+                              VARCHAR
+                          (
+                              100
+                          ) NOT NULL,
+                              due_date DATE,
+                              status VARCHAR
+                          (
+                              50
+                          ) DEFAULT '❌ 미진행',
+                              memo TEXT DEFAULT '',
+                              created_at TIMESTAMP WITH TIME ZONE DEFAULT timezone('utc'::text, now()) NOT NULL
+                              );
+                          """))
+        conn.commit()
+
+
 @st.cache_data(ttl=60)
 def get_all_meetings_from_supabase() -> List[dict]:
-    """저장된 전체 회의록 목록 조회 (캐싱을 통해 UI 깜빡임 방지)"""
+    """저장된 전체 회의록 목록 조회 (TTL 60초 캐싱)"""
     engine = get_db_engine()
     if not engine:
         return []
     with engine.connect() as conn:
         stmt = text("""
-            SELECT id, title, meeting_date, participants, raw_turns, structured_json, markdown_text, created_at
-            FROM meeting_records
-            ORDER BY meeting_date DESC, id DESC;
-        """)
+                    SELECT id,
+                           title,
+                           meeting_date,
+                           participants,
+                           raw_turns,
+                           structured_json,
+                           markdown_text,
+                           created_at
+                    FROM meeting_records
+                    ORDER BY meeting_date DESC, id DESC;
+                    """)
         result = conn.execute(stmt)
         return [dict(row._mapping) for row in result]
 
 
+@st.cache_data(ttl=60)
+def get_all_standalone_tasks_from_supabase() -> List[dict]:
+    """등록된 상시 과제 목록 조회"""
+    engine = get_db_engine()
+    if not engine:
+        return []
+    with engine.connect() as conn:
+        stmt = text("""
+                    SELECT id, task, owner, due_date, status, memo, created_at
+                    FROM standalone_tasks
+                    ORDER BY due_date ASC NULLS LAST, id DESC;
+                    """)
+        result = conn.execute(stmt)
+        return [dict(row._mapping) for row in result]
+
+
+def add_standalone_task_to_supabase(task: str, owner: str, due_date_val: Optional[date], status: str, memo: str):
+    """상시 과제 신규 저장"""
+    engine = get_db_engine()
+    if not engine:
+        return
+    with engine.connect() as conn:
+        stmt = text("""
+                    INSERT INTO standalone_tasks (task, owner, due_date, status, memo)
+                    VALUES (:task, :owner, :due_date, :status, :memo);
+                    """)
+        conn.execute(stmt, {
+            "task": task,
+            "owner": owner,
+            "due_date": due_date_val,
+            "status": status,
+            "memo": memo
+        })
+        conn.commit()
+    st.cache_data.clear()
+
+
+def delete_standalone_task_from_supabase(task_id: int):
+    """상시 과제 단건 삭제"""
+    engine = get_db_engine()
+    if not engine:
+        return
+    with engine.connect() as conn:
+        stmt = text("DELETE FROM standalone_tasks WHERE id = :id;")
+        conn.execute(stmt, {"id": task_id})
+        conn.commit()
+    st.cache_data.clear()
+
+
 def save_meeting_to_supabase(
-    title: str,
-    meeting_date: str,
-    participants: List[str],
-    raw_turns: List[dict],
-    structured_note: StructuredMeetingNote,
-    markdown_text: str
+        title: str,
+        meeting_date: str,
+        participants: List[str],
+        raw_turns: List[dict],
+        structured_note: StructuredMeetingNote,
+        markdown_text: str
 ) -> Optional[int]:
     """Supabase PostgreSQL에 회의록 신규 저장"""
     engine = get_db_engine()
@@ -121,12 +211,11 @@ def save_meeting_to_supabase(
 
     with engine.connect() as conn:
         stmt = text("""
-            INSERT INTO meeting_records (
-                title, meeting_date, participants, raw_turns, structured_json, markdown_text
-            ) VALUES (
-                :title, :meeting_date, :participants, :raw_turns, :structured_json, :markdown_text
-            ) RETURNING id;
-        """)
+                    INSERT INTO meeting_records (title, meeting_date, participants, raw_turns, structured_json,
+                                                 markdown_text)
+                    VALUES (:title, :meeting_date, :participants, :raw_turns, :structured_json,
+                            :markdown_text) RETURNING id;
+                    """)
         result = conn.execute(stmt, {
             "title": title,
             "meeting_date": meeting_date,
@@ -152,63 +241,82 @@ def update_meeting_markdown(meeting_id: int, new_markdown: str):
     st.cache_data.clear()
 
 
-def update_action_items_fine_grained(modified_items: List[dict]):
+def update_action_items_unified(meeting_targets: List[dict], standalone_targets: List[dict]):
     """
-    동시성 덮어쓰기 방지:
-    상태, 메모뿐만 아니라 변경된 '마감 기한'까지 해당 회의의 최신 DB 레코드에 원자적 반영
+    회의 과제와 상시 과제를 각각 원자적으로 안전 갱신하여 동시성 덮어쓰기를 방지합니다.
     """
     engine = get_db_engine()
-    if not engine or not modified_items:
+    if not engine:
         return
 
-    grouped = {}
-    for item in modified_items:
-        m_id = item["meeting_id"]
-        grouped.setdefault(m_id, []).append(item)
-
     with engine.connect() as conn:
-        for m_id, items in grouped.items():
-            stmt = text("SELECT structured_json FROM meeting_records WHERE id = :id;")
-            row = conn.execute(stmt, {"id": m_id}).fetchone()
-            if not row:
-                continue
+        # 1. 회의 과제 개별 반영
+        if meeting_targets:
+            grouped = {}
+            for item in meeting_targets:
+                grouped.setdefault(item["meeting_id"], []).append(item)
 
-            raw_val = row[0]
-            s_data = json.loads(raw_val) if isinstance(raw_val, str) else raw_val
-            action_items = s_data.get("action_items", [])
+            for m_id, items in grouped.items():
+                stmt = text("SELECT structured_json FROM meeting_records WHERE id = :id;")
+                row = conn.execute(stmt, {"id": m_id}).fetchone()
+                if not row:
+                    continue
 
-            for it in items:
-                idx = it["item_idx"]
-                if idx < len(action_items):
-                    action_items[idx]["status"] = it["new_status"]
-                    action_items[idx]["memo"] = it["new_memo"]
-                    action_items[idx]["due_date"] = it["new_due_date"]  # YYYY-MM-DD 또는 None
+                raw_val = row[0]
+                s_data = json.loads(raw_val) if isinstance(raw_val, str) else raw_val
+                action_items = s_data.get("action_items", [])
 
-            s_data["action_items"] = action_items
+                for it in items:
+                    idx = it["item_idx"]
+                    if idx < len(action_items):
+                        action_items[idx]["status"] = it["new_status"]
+                        action_items[idx]["memo"] = it["new_memo"]
+                        action_items[idx]["due_date"] = it["new_due_date"]
 
-            try:
-                note_obj = StructuredMeetingNote.model_validate(s_data)
-                new_md = render_to_markdown(note_obj)
-            except Exception:
-                new_md = None
+                s_data["action_items"] = action_items
 
-            if new_md:
-                upd_stmt = text("""
-                    UPDATE meeting_records 
-                    SET structured_json = :sj, markdown_text = :md 
-                    WHERE id = :id;
-                """)
-                conn.execute(upd_stmt, {
-                    "sj": json.dumps(s_data, ensure_ascii=False),
-                    "md": new_md,
-                    "id": m_id
+                try:
+                    note_obj = StructuredMeetingNote.model_validate(s_data)
+                    new_md = render_to_markdown(note_obj)
+                except Exception:
+                    new_md = None
+
+                if new_md:
+                    upd_stmt = text("""
+                                    UPDATE meeting_records
+                                    SET structured_json = :sj,
+                                        markdown_text   = :md
+                                    WHERE id = :id;
+                                    """)
+                    conn.execute(upd_stmt, {
+                        "sj": json.dumps(s_data, ensure_ascii=False),
+                        "md": new_md,
+                        "id": m_id
+                    })
+                else:
+                    upd_stmt = text("UPDATE meeting_records SET structured_json = :sj WHERE id = :id;")
+                    conn.execute(upd_stmt, {
+                        "sj": json.dumps(s_data, ensure_ascii=False),
+                        "id": m_id
+                    })
+
+        # 2. 상시 과제 개별 반영
+        if standalone_targets:
+            for st_item in standalone_targets:
+                upd_st = text("""
+                              UPDATE standalone_tasks
+                              SET status   = :status,
+                                  memo     = :memo,
+                                  due_date = :due_date
+                              WHERE id = :id;
+                              """)
+                conn.execute(upd_st, {
+                    "id": st_item["task_id"],
+                    "status": st_item["new_status"],
+                    "memo": st_item["new_memo"],
+                    "due_date": st_item["new_due_date"]
                 })
-            else:
-                upd_stmt = text("UPDATE meeting_records SET structured_json = :sj WHERE id = :id;")
-                conn.execute(upd_stmt, {
-                    "sj": json.dumps(s_data, ensure_ascii=False),
-                    "id": m_id
-                })
+
         conn.commit()
     st.cache_data.clear()
 
@@ -436,9 +544,12 @@ def generate_pdf_bytes(note: StructuredMeetingNote) -> bytes:
     elements = []
 
     styles = getSampleStyleSheet()
-    title_style = ParagraphStyle('DocTitle', parent=styles['Heading1'], fontName=font_name, fontSize=18, leading=22, textColor=colors.HexColor("#1A202C"))
-    h2_style = ParagraphStyle('SectionH2', parent=styles['Heading2'], fontName=font_name, fontSize=12, leading=16, textColor=colors.HexColor("#2B6CB0"), spaceBefore=10, spaceAfter=6)
-    body_style = ParagraphStyle('BodyKR', parent=styles['Normal'], fontName=font_name, fontSize=8.5, leading=12, textColor=colors.HexColor("#2D3748"))
+    title_style = ParagraphStyle('DocTitle', parent=styles['Heading1'], fontName=font_name, fontSize=18, leading=22,
+                                 textColor=colors.HexColor("#1A202C"))
+    h2_style = ParagraphStyle('SectionH2', parent=styles['Heading2'], fontName=font_name, fontSize=12, leading=16,
+                              textColor=colors.HexColor("#2B6CB0"), spaceBefore=10, spaceAfter=6)
+    body_style = ParagraphStyle('BodyKR', parent=styles['Normal'], fontName=font_name, fontSize=8.5, leading=12,
+                                textColor=colors.HexColor("#2D3748"))
     bold_style = ParagraphStyle('BoldKR', parent=body_style, fontName=font_name, textColor=colors.HexColor("#1A202C"))
 
     elements.append(Paragraph(f"{note.meeting_title} 회의록", title_style))
@@ -514,10 +625,17 @@ def generate_pdf_bytes(note: StructuredMeetingNote) -> bytes:
 # 6. Streamlit 메인 애플리케이션
 # =========================================================
 def main():
-    st.set_page_config(page_title="팀 회의록 관리 시스템", layout="wide", page_icon="📝")
+    st.set_page_config(page_title="팀 회의록 & 과제 관리 시스템", layout="wide", page_icon="📝")
 
     api_key = os.getenv("OPENAI_API_KEY")
     db_url = os.getenv("DATABASE_URL")
+
+    # DB 테이블 자동 점검 및 생성
+    if db_url:
+        try:
+            init_db()
+        except Exception:
+            pass
 
     # 세션 상태 초기화
     if "turns" not in st.session_state:
@@ -553,11 +671,12 @@ def main():
         for member in FIXED_MEMBER_POOL:
             st.markdown(f"- **{member}**")
 
-    # 3대 탭 구성
-    tab_new, tab_history, tab_actions = st.tabs([
+    # 4대 탭 구성
+    tab_new, tab_history, tab_actions, tab_standalone = st.tabs([
         "📝 새 회의 작성 및 정리",
         "☁️ Supabase 회의록 보관함",
-        "📌 팀 과제(Action Items) 현황판"
+        "📌 팀 과제(Action Items) 현황판",
+        "➕ 상시 과제 직접 등록"
     ])
 
     # -----------------------------------------------------
@@ -688,7 +807,8 @@ def main():
 
                             response = client.chat.completions.create(
                                 model=model_name,
-                                messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
+                                messages=[{"role": "system", "content": system_prompt},
+                                          {"role": "user", "content": user_prompt}],
                                 response_format={"type": "json_object"},
                                 temperature=0.1
                             )
@@ -825,13 +945,15 @@ def main():
                         with st.expander("🗑️ 이 회의록 삭제하기"):
                             st.warning("삭제 시 Supabase에서 영구 제거됩니다.")
                             confirm_del = st.checkbox("정말로 이 회의록을 삭제하시겠습니까?", key=f"chk_del_{detail['id']}")
-                            if st.button("삭제 실행", type="primary", disabled=not confirm_del, key=f"btn_del_{detail['id']}"):
+                            if st.button("삭제 실행", type="primary", disabled=not confirm_del,
+                                         key=f"btn_del_{detail['id']}"):
                                 delete_meeting_from_supabase(detail['id'])
                                 st.success("회의록이 삭제되었습니다.")
                                 st.rerun()
 
                         with st.expander("🔍 원본 발언 로그 보기"):
-                            raw_data = detail['raw_turns'] if isinstance(detail['raw_turns'], list) else json.loads(detail['raw_turns'])
+                            raw_data = detail['raw_turns'] if isinstance(detail['raw_turns'], list) else json.loads(
+                                detail['raw_turns'])
                             for r in raw_data:
                                 st.write(f"- **{r['speaker']}**: {r['content']}")
 
@@ -849,7 +971,9 @@ def main():
                             use_container_width=True
                         )
                         try:
-                            note_dict = detail['structured_json'] if isinstance(detail['structured_json'], dict) else json.loads(detail['structured_json'])
+                            note_dict = detail['structured_json'] if isinstance(detail['structured_json'],
+                                                                                dict) else json.loads(
+                                detail['structured_json'])
                             note_obj = StructuredMeetingNote.model_validate(note_dict)
                             pdf_data = generate_pdf_bytes(note_obj)
                             d_c2.download_button(
@@ -868,7 +992,8 @@ def main():
 
                         edit_hist_mode = st.toggle("✏️ 마크다운 편집 모드", key=f"edit_hist_mode_{detail['id']}")
                         if edit_hist_mode:
-                            hist_edited_text = st.text_area("마크다운 내용 편집", value=detail['markdown_text'], height=500, key=f"area_edit_{detail['id']}")
+                            hist_edited_text = st.text_area("마크다운 내용 편집", value=detail['markdown_text'], height=500,
+                                                            key=f"area_edit_{detail['id']}")
                             if st.button("💾 수정한 내용 DB에 즉시 갱신", type="primary", key=f"save_edit_{detail['id']}"):
                                 update_meeting_markdown(detail['id'], hist_edited_text)
                                 st.success("수정 사항이 Supabase에 업데이트되었습니다!")
@@ -879,24 +1004,26 @@ def main():
                                 st.markdown(detail['markdown_text'])
 
     # -----------------------------------------------------
-    # TAB 3: 팀 과제(Action Items) 현황판 (마감 기한 변경 가능)
+    # TAB 3: 팀 과제(Action Items) 현황판 (회의 과제 + 상시 과제 통합)
     # -----------------------------------------------------
     with tab_actions:
-        st.subheader("📌 팀 과제(Action Items) 현황판")
-        st.caption("표에서 상태, 마감 기한(캘린더 클릭), 메모를 자유롭게 조정한 후 '💾 저장'을 누르면 DB에 안전하게 반영됩니다.")
+        st.subheader("📌 팀 과제(Action Items) 통합 현황판")
+        st.caption("회의록에서 도출된 과제와 직접 등록한 상시 과제가 모두 모여 있습니다. 표에서 수정 후 '💾 저장'을 누르면 DB에 안전하게 반영됩니다.")
 
         all_records = get_all_meetings_from_supabase()
+        standalone_records = get_all_standalone_tasks_from_supabase()
         aggregated_items = []
 
+        # 1. 회의록 과제 적재
         for rec in all_records:
             try:
-                s_data = rec['structured_json'] if isinstance(rec['structured_json'], dict) else json.loads(rec['structured_json'])
+                s_data = rec['structured_json'] if isinstance(rec['structured_json'], dict) else json.loads(
+                    rec['structured_json'])
                 for idx, item in enumerate(s_data.get("action_items", [])):
                     st_val = item.get("status") or "❌ 미진행"
                     if st_val not in ["❌ 미진행", "⏳ 진행중", "✅ 완료"]:
                         st_val = "❌ 미진행"
 
-                    # 마감 기한 날짜 객체 파싱
                     raw_due = item.get("due_date")
                     due_date_obj = None
                     if raw_due:
@@ -909,21 +1036,50 @@ def main():
                             due_date_obj = None
 
                     aggregated_items.append({
+                        "_source": "meeting",
                         "_meeting_id": rec['id'],
                         "_item_idx": idx,
+                        "_task_id": None,
                         "상태": st_val,
                         "담당자": item.get("owner", "미지정"),
                         "실행 과제 (Task)": item.get("task", ""),
                         "마감 기한": due_date_obj,
                         "메모": item.get("memo", ""),
-                        "출처 회의": rec['title'],
-                        "회의 일자": rec['meeting_date']
+                        "출처": f"회의: {rec['title']}",
+                        "등록/회의 일자": rec['meeting_date']
                     })
             except Exception:
                 continue
 
+        # 2. 상시 과제 적재
+        for st_row in standalone_records:
+            st_val = st_row.get("status") or "❌ 미진행"
+            if st_val not in ["❌ 미진행", "⏳ 진행중", "✅ 완료"]:
+                st_val = "❌ 미진행"
+
+            due_date_obj = st_row.get("due_date")
+            if due_date_obj and isinstance(due_date_obj, str):
+                try:
+                    due_date_obj = datetime.strptime(due_date_obj[:10], "%Y-%m-%d").date()
+                except Exception:
+                    due_date_obj = None
+
+            aggregated_items.append({
+                "_source": "standalone",
+                "_meeting_id": None,
+                "_item_idx": None,
+                "_task_id": st_row["id"],
+                "상태": st_val,
+                "담당자": st_row.get("owner", "미지정"),
+                "실행 과제 (Task)": st_row.get("task", ""),
+                "마감 기한": due_date_obj,
+                "메모": st_row.get("memo", ""),
+                "출처": "📌 상시 직접 등록",
+                "등록/회의 일자": str(st_row["created_at"])[:10]
+            })
+
         if not aggregated_items:
-            st.info("등록된 액션 아이템이 없습니다.")
+            st.info("등록된 과제(Action Items)가 없습니다.")
         else:
             df_tasks = pd.DataFrame(aggregated_items)
 
@@ -948,25 +1104,29 @@ def main():
 
             with b_col1:
                 label_all = f"📁 전체 과제 ({cnt_total}건)" + ("  👈" if curr_status == "전체" else "")
-                if st.button(label_all, use_container_width=True, type="primary" if curr_status == "전체" else "secondary"):
+                if st.button(label_all, use_container_width=True,
+                             type="primary" if curr_status == "전체" else "secondary"):
                     st.session_state.action_status_card_filter = "전체"
                     st.rerun()
 
             with b_col2:
                 label_x = f"❌ 미진행 ({cnt_x}건)" + ("  👈" if curr_status == "❌ 미진행" else "")
-                if st.button(label_x, use_container_width=True, type="primary" if curr_status == "❌ 미진행" else "secondary"):
+                if st.button(label_x, use_container_width=True,
+                             type="primary" if curr_status == "❌ 미진행" else "secondary"):
                     st.session_state.action_status_card_filter = "❌ 미진행"
                     st.rerun()
 
             with b_col3:
                 label_p = f"⏳ 진행중 ({cnt_p}건)" + ("  👈" if curr_status == "⏳ 진행중" else "")
-                if st.button(label_p, use_container_width=True, type="primary" if curr_status == "⏳ 진행중" else "secondary"):
+                if st.button(label_p, use_container_width=True,
+                             type="primary" if curr_status == "⏳ 진행중" else "secondary"):
                     st.session_state.action_status_card_filter = "⏳ 진행중"
                     st.rerun()
 
             with b_col4:
                 label_d = f"✅ 완료 ({cnt_d}건)" + ("  👈" if curr_status == "✅ 완료" else "")
-                if st.button(label_d, use_container_width=True, type="primary" if curr_status == "✅ 완료" else "secondary"):
+                if st.button(label_d, use_container_width=True,
+                             type="primary" if curr_status == "✅ 완료" else "secondary"):
                     st.session_state.action_status_card_filter = "✅ 완료"
                     st.rerun()
 
@@ -977,12 +1137,14 @@ def main():
 
             st.markdown("---")
 
-            # 3. 데이터 에디터 (마감 기한 DateColumn 활성화)
+            # 3. 데이터 에디터
             edited_df = st.data_editor(
                 display_df,
                 column_config={
+                    "_source": None,
                     "_meeting_id": None,
                     "_item_idx": None,
+                    "_task_id": None,
                     "상태": st.column_config.SelectboxColumn(
                         "상태 (클릭 변경)",
                         options=["❌ 미진행", "⏳ 진행중", "✅ 완료"],
@@ -997,19 +1159,21 @@ def main():
                         width="small"
                     ),
                     "메모": st.column_config.TextColumn("메모 / 코멘트 (더블클릭 작성)", width="large"),
-                    "출처 회의": st.column_config.TextColumn("출처 회의", disabled=True),
-                    "회의 일자": st.column_config.TextColumn("회의 일자", disabled=True),
+                    "출처": st.column_config.TextColumn("출처", disabled=True),
+                    "등록/회의 일자": st.column_config.TextColumn("일자", disabled=True),
                 },
                 hide_index=True,
                 use_container_width=True,
                 key="action_items_interactive_editor"
             )
 
-            # 4. 저장 시 마감 기한 변경사항까지 추적하여 안전 업데이트
+            # 4. 일괄 저장 로직
             if st.button("💾 상태·기한·메모 변경사항 DB에 안전 저장", type="primary", use_container_width=True):
-                modified_targets = []
+                modified_meeting_targets = []
+                modified_standalone_targets = []
+
                 orig_lookup = {
-                    (item["_meeting_id"], item["_item_idx"]): item
+                    (item["_source"], item["_meeting_id"], item["_item_idx"], item["_task_id"]): item
                     for item in aggregated_items
                 }
 
@@ -1024,7 +1188,7 @@ def main():
                     return s if s else None
 
                 for _, row in edited_df.iterrows():
-                    key = (row["_meeting_id"], row["_item_idx"])
+                    key = (row["_source"], row["_meeting_id"], row["_item_idx"], row["_task_id"])
                     if key in orig_lookup:
                         orig = orig_lookup[key]
                         new_st = row["상태"]
@@ -1032,22 +1196,91 @@ def main():
                         new_due_str = to_iso_date(row["마감 기한"])
                         orig_due_str = to_iso_date(orig["마감 기한"])
 
-                        # 상태, 메모, 마감 기한 중 하나라도 변경되었으면 대상에 등록
                         if (new_st != orig["상태"]) or (new_mem != orig["메모"]) or (new_due_str != orig_due_str):
-                            modified_targets.append({
-                                "meeting_id": row["_meeting_id"],
-                                "item_idx": int(row["_item_idx"]),
-                                "new_status": new_st,
-                                "new_memo": new_mem,
-                                "new_due_date": new_due_str
-                            })
+                            if row["_source"] == "meeting":
+                                modified_meeting_targets.append({
+                                    "meeting_id": row["_meeting_id"],
+                                    "item_idx": int(row["_item_idx"]),
+                                    "new_status": new_st,
+                                    "new_memo": new_mem,
+                                    "new_due_date": new_due_str
+                                })
+                            else:
+                                modified_standalone_targets.append({
+                                    "task_id": row["_task_id"],
+                                    "new_status": new_st,
+                                    "new_memo": new_mem,
+                                    "new_due_date": new_due_str
+                                })
 
-                if not modified_targets:
+                if not modified_meeting_targets and not modified_standalone_targets:
                     st.info("변경된 내용이 없습니다.")
                 else:
-                    update_action_items_fine_grained(modified_targets)
-                    st.success(f"총 {len(modified_targets)}건의 과제(상태/기한/메모)가 DB에 안전하게 반영되었습니다!")
+                    update_action_items_unified(modified_meeting_targets, modified_standalone_targets)
+                    total_mod = len(modified_meeting_targets) + len(modified_standalone_targets)
+                    st.success(
+                        f"총 {total_mod}건의 과제(회의 {len(modified_meeting_targets)}건, 상시 {len(modified_standalone_targets)}건)가 DB에 안전하게 반영되었습니다!")
                     st.rerun()
+
+    # -----------------------------------------------------
+    # TAB 4: 상시 과제 직접 등록 및 관리 (신규 기능)
+    # -----------------------------------------------------
+    with tab_standalone:
+        st.subheader("➕ 상시 과제 직접 등록")
+        st.caption("정규 회의록 외에 일상 업무, 긴급 버그 수정, 개인 과제 등을 등록하여 팀 현황판에 공유합니다.")
+
+        c_form, c_view = st.columns([5, 5])
+
+        with c_form:
+            with st.form("new_standalone_task_form", clear_on_submit=True):
+                st.markdown("##### 📝 과제 정보 입력")
+                st_task_name = st.text_input("과제 내용 (Task)", placeholder="예: Supabase 백업 정책 수립 및 자동화")
+
+                f_c1, f_c2 = st.columns(2)
+                with f_c1:
+                    st_owner = st.selectbox("담당자 지정", options=FIXED_MEMBER_POOL + ["미지정"])
+                with f_c2:
+                    st_status = st.selectbox("초기 상태", options=["❌ 미진행", "⏳ 진행중", "✅ 완료"], index=0)
+
+                st_due_date = st.date_input("마감 기한 (선택 사항)", value=date.today())
+                st_memo = st.text_area("메모 및 참고사항", placeholder="예: AWS S3 버킷 설정 필요", height=80)
+
+                submitted = st.form_submit_button("과제 등록하기 (+)", type="primary", use_container_width=True)
+                if submitted:
+                    if not st_task_name.strip():
+                        st.warning("과제 내용을 입력해주세요.")
+                    else:
+                        add_standalone_task_to_supabase(
+                            task=st_task_name.strip(),
+                            owner=st_owner,
+                            due_date_val=st_due_date,
+                            status=st_status,
+                            memo=st_memo.strip()
+                        )
+                        st.success("상시 과제가 등록되었습니다! [📌 팀 과제 현황판]에서도 확인할 수 있습니다.")
+                        st.rerun()
+
+        with c_view:
+            st.markdown("##### 📋 등록된 상시 과제 관리")
+            current_standalone = get_all_standalone_tasks_from_supabase()
+
+            if not current_standalone:
+                st.info("등록된 상시 과제가 없습니다.")
+            else:
+                for t in current_standalone:
+                    with st.container(border=True):
+                        t_c1, t_c2 = st.columns([8, 2])
+                        with t_c1:
+                            st.markdown(f"**{t['status']} {t['task']}**")
+                            d_str = t['due_date'].strftime('%Y-%m-%d') if t.get('due_date') else '기한 없음'
+                            st.caption(f"👤 담당: **{t['owner']}** | 📅 마감: {d_str}")
+                            if t.get('memo'):
+                                st.caption(f"💬 메모: {t['memo']}")
+                        with t_c2:
+                            if st.button("삭제", key=f"del_st_task_{t['id']}", use_container_width=True):
+                                delete_standalone_task_from_supabase(t['id'])
+                                st.success("과제가 삭제되었습니다.")
+                                st.rerun()
 
 
 if __name__ == "__main__":
