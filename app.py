@@ -619,10 +619,51 @@ def generate_pdf_bytes(note: StructuredMeetingNote) -> bytes:
 
 
 # =========================================================
-# 6. Streamlit 메인 애플리케이션
+# 6. 비밀번호 게이트 인증 함수 (Option A)
+# =========================================================
+def check_password() -> bool:
+    """팀 비밀번호 인증 게이트 (올바른 비밀번호 입력 전까지 전체 UI 차단)"""
+    if st.session_state.get("authenticated", False):
+        return True
+
+    st.markdown("<br><br>", unsafe_allow_html=True)
+    c1, c2, c3 = st.columns([3, 4, 3])
+    with c2:
+        st.markdown("<h2 style='text-align: center;'>🔒 팀 내부 시스템 접근 인증</h2>", unsafe_allow_html=True)
+        st.markdown("<p style='text-align: center; color: gray;'>인가된 팀원 전용 시스템입니다. 비밀번호를 입력해주세요.</p>",
+                    unsafe_allow_html=True)
+
+        with st.form("team_login_form", clear_on_submit=False):
+            input_pw = st.text_input("비밀번호 (TEAM_PASSWORD)", type="password", placeholder="비밀번호 입력")
+            submit = st.form_submit_button("인증 및 접속하기", use_container_width=True, type="primary")
+
+            if submit:
+                # 1. Streamlit Secrets 우선 확인, 2. OS 환경변수 확인, 3. 기본값 'team2' 확인
+                target_pw = "team2"
+                if hasattr(st, "secrets") and "TEAM_PASSWORD" in st.secrets:
+                    target_pw = str(st.secrets["TEAM_PASSWORD"]).strip()
+                elif os.getenv("TEAM_PASSWORD"):
+                    target_pw = os.getenv("TEAM_PASSWORD").strip()
+
+                if input_pw.strip() == target_pw:
+                    st.session_state["authenticated"] = True
+                    st.success("✅ 인증 성공! 시스템을 로드합니다.")
+                    st.rerun()
+                else:
+                    st.error("❌ 비밀번호가 올바르지 않습니다.")
+
+    return False
+
+
+# =========================================================
+# 7. Streamlit 메인 애플리케이션
 # =========================================================
 def main():
     st.set_page_config(page_title="팀 회의록 & 과제 관리 시스템", layout="wide", page_icon="📝")
+
+    # [보안 게이트] 비밀번호 인증이 완료되지 않으면 실행 중단
+    if not check_password():
+        st.stop()
 
     api_key = os.getenv("OPENAI_API_KEY")
     db_url = os.getenv("DATABASE_URL")
@@ -676,6 +717,11 @@ def main():
         for member in FIXED_MEMBER_POOL:
             st.markdown(f"- **{member}**")
 
+        st.markdown("---")
+        if st.button("🔒 로그아웃", use_container_width=True):
+            st.session_state["authenticated"] = False
+            st.rerun()
+
     # 4대 탭 구성
     tab_new, tab_history, tab_actions, tab_standalone = st.tabs([
         "📝 새 회의 작성 및 정리",
@@ -704,7 +750,6 @@ def main():
                     default=FIXED_MEMBER_POOL
                 )
 
-            # 이전 회의 자동 연동 및 선택 영역
             st.markdown("##### 🔗 이전 회의 팔로업 연동")
             if all_existing_meetings:
                 ctx_choices = {}
