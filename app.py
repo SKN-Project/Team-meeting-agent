@@ -77,9 +77,13 @@ def get_db_engine():
     db_url = os.getenv("DATABASE_URL")
     if not db_url:
         return None
-    # SQLAlchemy용 postgresql 드라이버 접두사 호환성 보정
+
+    # 드라이버 미지정 시 psycopg 드라이버 명시
     if db_url.startswith("postgres://"):
-        db_url = db_url.replace("postgres://", "postgresql://", 1)
+        db_url = db_url.replace("postgres://", "postgresql+psycopg://", 1)
+    elif db_url.startswith("postgresql://") and "+psycopg" not in db_url and "+psycopg2" not in db_url:
+        db_url = db_url.replace("postgresql://", "postgresql+psycopg://", 1)
+
     return create_engine(db_url, pool_pre_ping=True)
 
 
